@@ -10,3 +10,6 @@ Depending on the qualities of the specific input videos being used, the space sa
 The AV-1 side of this tool is not yet complete, as I am waiting for ffmpeg 5 to become widespread in terms of availability.  This has much better support for the Intel SVT-AV1 encoder.  Currently, to use SVT-AV1, then a 2 step process is required with ffmpeg.  I did not want to get into with this tool given that it will soon be superseded by the options arriving in ffmpeg5. 
 
 This tool has been tested and used on linux only, but should be able to support both MacOS and Windows. 
+
+Dependencies: ffmpeg, libnotify (for alert option)
+
