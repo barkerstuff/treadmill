@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+
+# Copyright Jason Barker 2022 under the GNU General Public License v3
+
+# Python based file compressability calculator and libx265 aided video media dieting tool!
+
+# To do:
+# Add the map part to the av1 subprocess build too.  Right now it will only get first audio and ?maybe no subs
+# Check the subtitle handling
+
+import os
+import subprocess
+import sys
+import argparse
+import tempfile
+import shutil
+import re
+from statistics import mean
+from platform import system
+
+preset="slow"
+outformat="mkv"
+format_list = ['.mkv', '.f4v', '.mts', '.ts', '.mov', '.asf', '.avi', '.m2ts', '.f4v', '.webm', '.webm', '.3gp', '.mp4', '.mpv', '.divx', '.mpg', '.wmv', '.mpeg', '.flv', '.m4v']
+#format_list = ['.mkv', '.f4v', '.mts', '.mov', '.asf', '.avi', '.m2ts', '.f4v', '.webm', '.webm', '.3gp', '.mp4', '.mpv', '.divx', '.mpg', '.wmv', '.mpeg', '.flv', '.m4v']
+
+# Factor compression estimate compensation is tuned to 3 sample points, 16s sample lengths.  In theory more points from here should increase accuracy at cost of time.  
+sample_points = 3
+sample_length = 16
+
+# Corresponds to XDG base directory specification
+if system() == 'Linux' or system() == 'FreeBSD' or system() == 'OpenBSD' or system() == 'Darwin' or system() == 'NetBSD' or system() == 'DragonflyBSD':
+    config_base = os.path.expanduser('~') + os.sep + '.config/treadmill'
+    sys.stdout.write("\x1b]2;treadmill\x07")
+elif system() == 'Windows':
+    config_base = 'c:\\users\\poop\\AppData\\local\\treadmill'
+    sys.exit('To implement.')
+
+# Parser init
+parser = argparse.ArgumentParser(description='Scans a given folder and identifies good targets video files for libx265 or SVT-1 transcode. Copyright Jason Barker 2022 under GNU GPL3 license.')
+parser.set_defaults(cutoff=1.6, alert=False, mkv=True, auto=False, verbose=False, mp4=False, r1080=False, r720=False, r480=False, noaudiocopy=False, lq=False, hq=False, filmgrain=False, animation=False, exclude='efsa8uj83jiefsjdh83ewhsdnjkdncnsbxz')
+parser.add_argument('--tardir', '-t', type=str, help='File to transcode. This is a required argument.')
+parser.add_argument('--cutoff', type=float, help='Cutoff for compression ratio to decide whether a transcode is worth it or not. For example, a value of 1.5 will keep a file if it is compressed by more than half. If --samplecutoff is also specified then this will only apply to the choice to keep or delete post-encode, otherwise it will determine both stages.')
+parser.add_argument('--samplecutoff', type=float, help='Cutoff for compression ratio to decide whether a transcode is worth it or not. This only applies to the sample run, the choice to delete or keep a file post cutoff will be determined by --cutoff.')
+parser.add_argument('--trans', action='store_true', help='Set an extremely high crf value for the transcode.  This should produce video that is reliably transparent to source at large file size cost.')
+parser.add_argument('--uhq', action='store_true', help='Set a very high crf value for the transcode.  In most cases this should be somewhat transparent to source.')
+parser.add_argument('--hq', action='store_true', help='Set a high crf value for the transcode.  This is the default setting.')
+parser.add_argument('--mq', action='store_true', help='Set a medium crf value for the transcode.')
+parser.add_argument('--lq', action='store_true', help='Set a low crf value of for the transcode.')
+parser.add_argument('--ulq', action='store_true', help='Set a low crf value of for the transcode. This produces small video size at the cost of considerable degradation.')
+parser.add_argument('--crf', type=int, help='Set a custom crf value.')
+parser.add_argument('--r1080', action='store_true', help='Resize the transcoded video to 1080p.')
+parser.add_argument('--r720', action='store_true', help='Resize the transcoded video to 720p.')
+parser.add_argument('--r480', action='store_true', help='Resize the transcoded video to 480p.')
+parser.add_argument('--resizehack', action='store_true', help='Force explicit rescale without maintaining aspect.')
+parser.add_argument('--noaudiocopy', action='store_true', help='Tries to copy audio rather than transcode.')
+parser.add_argument('--stereo', action='store_true', help='Downmix all audio into stereo.')
+parser.add_argument('--mkv', action='store_true', help='Mux transcodes into mkv container.')
+parser.add_argument('--mp4', action='store_true', help='Mux transcodes into mp4 container.')
+parser.add_argument('--dry', '-d', action='store_true', help='Do not call ffmpeg to transcode, only print the command to be sent.')
+parser.add_argument('--alert', action='store_true', help='Send an audio alert charm when complete. Will not send audio alert if user is idle.')
+parser.add_argument('--nodelete', action='store_true', help='Do not delete files post transcode.')
+parser.add_argument('--slower', action='store_true', help='Use slower preset rather than slow (slight improvement in file size at large time expense)')
+parser.add_argument('--x265av1', action='store_true', help='Test x265 and compare to AV1-SVT. Pick the best on a per file basis. This isn\'t inplemented yet.')
+parser.add_argument('--av1', action='store_true', help='Use the SVT-AV1 encoder rather than libx265.')
+parser.add_argument('--verbose', '-v', action='store_true', help='Provides additional output for debug purposes.')
+parser.add_argument('--interactive', '-i', action='store_true', help='Interactively prompts user regarding choices for each transcode.')
+parser.add_argument('--largestfirst', '-s', action='store_true', help='Start with the largest files first. This will produce generally higher yield in terms of space per time.')
+parser.add_argument('--perdurationfirst', '-S', action='store_true', help='Start with the highest bitrate first.  This often yields fast space returns on a per time basis, depending on the content.')
+parser.add_argument('--persizeresfirst', '-R', action='store_true', help='Start with the largest files per resolution per duration. This will generally work with poor encodes and noisy sources start and may yield faster space returns.')
+parser.add_argument('--notranscode', '-n', action='store_true', help='Do not actually transcode the file.')
+parser.add_argument('--animation', '-A', action='store_true', help='Tunes for animated content.')
+parser.add_argument('--filmgrain', '-F', action='store_true', help='For x265, this tunes for grainy film content. Reduces quantisation error at cost of possible ringing artifacts. For SVT-AV1 it instead adds some mild film grain synthesis.')
+parser.add_argument('--project', '-p', type=str, help='Specify a project name. This will allow for resuming of operations. The logfile is stored at {}{}$projectname'.format(config_base, os.sep, os.sep, os.sep))
+parser.add_argument('--projectdelete', type=str, help='Delete a specific project file.')
+parser.add_argument('--nomuxts', action='store_true', help='Skip .ts (transport stream) videos rather than remux them.')
+parser.add_argument('--license', action='store_true', help='Print the license for this tool.')
+parser.add_argument('--exclude', type=str, help='Excludes paths matching this.')
+parser.add_argument('--test', action='store_true', help='Call mpv or vlc to test each file in turn.')
+parser.add_argument('--altexec', type=str, help='Provide an alternative ffmpeg executable.')
+
+args = parser.parse_args()
+
+if args.av1:
+    # For SVT-AV1 lower = slower
+    if args.slower:
+        preset='4'
+    else:
+        preset='6'
+elif not args.av1: 
+    if args.slower:
+        preset='slower'
+    else:
+        preset='slow'
+
+resargcnt = 0
+
+# Sanity checks for parser
+if not args.lq and not args.mq and not args.hq and not args.uhq:
+    # Set HQ default
+    args.hq = True
+# Ensure multiple quality args not passed
+if args.lq:
+    resargcnt = resargcnt + 1
+if args.mq:
+    resargcnt = resargcnt + 1
+if args.hq:
+    resargcnt = resargcnt + 1
+if args.uhq:
+    resargcnt = resargcnt + 1
+if args.trans:
+    resargcnt = resargcnt + 1
+if resargcnt > 1:
+    sys.exit('Only one quality option can be specified. Exiting.')
+
+if args.mkv and args.mp4:
+    sys.exit('Cannot pass both --mkv and --mp4 as args! Choose one container!')
+if args.r720 and args.r1080:
+    sys.exit('Cannot set multiple resize options simultaneously. Cya!')
+if args.r720 and args.r480:
+    sys.exit('Cannot set multiple resize options simultaneously. Cya!')
+if args.r480 and args.r1080:
+    sys.exit('Cannot set multiple resize options simultaneously. Cya!')
+if args.r480 and args.r720:
+    sys.exit('Cannot set multiple resize options simultaneously. Cya!')
+if args.r1080 and args.r720:
+    sys.exit('Cannot set multiple resize options simultaneously. Cya!')
+if args.r1080 and args.r480:
+    sys.exit('Cannot set multiple resize options simultaneously. Cya!')
+
+# Set absolute path from relative
+if not args.tardir:
+    sys.exit('A target path containing videos is required.  Please use the -t flag to specify this.')
+args.tardir = os.path.abspath(args.tardir)
+if not os.path.isdir(args.tardir):
+    sys.exit('Target directory {} does not exist. Exiting.'.format(args.tardir))
+
+# Set ts mux state
+if args.nomuxts:
+    format_list.remove('.ts')
+
+# Set tempfile.  If using a project name base the temp file on this name, otherwise it can delete files and clash with other treadmill processes.
+if args.mkv:
+    if args.project:
+        temp_video = tempfile.gettempdir() + os.sep + 'temp' + args.project + '.mkv'
+    else:
+        temp_video = tempfile.gettempdir() + os.sep + 'temp' + '.mkv'
+elif args.mp4:
+    if args.project:
+        temp_video = tempfile.gettempdir() + os.sep + 'temp' + args.project + '.mp4'
+    else:
+        temp_video = tempfile.gettempdir() + os.sep + 'temp' + '.mp4'
+
+# Set project file (if using --project flag)
+if system() == 'Linux' and args.project:
+    # Create project log directory
+    project_dir = os.path.expanduser('~') + os.sep + '.config/treadmiller'
+    try:
+        os.mkdir(project_dir)
+    except:
+        pass
+    project_logfile = project_dir + os.sep + args.project  # Contains a text list of files that have been sampled/transcoded for use in project mode.
+elif system() == 'Linux' and args.projectdelete:
+    # Create project log directory
+    project_dir = os.path.expanduser('~') + os.sep + '.config/treadmiller'
+    try:
+        os.mkdir(project_dir)
+    except:
+        pass
+    project_logfile = project_dir + os.sep + args.projectdelete  # Contains a text list of files that have been sampled/transcoded for use in project mode.
+elif system() == 'Win32' and args.project:
+    sys.exit('Windows folders not implemented yet.')
+
+# Determine crf
+if args.crf:
+    crf = args.crf
+if not args.av1:
+    if args.lq:
+        crf = "27"
+    elif args.uhq:
+        crf = "19"
+    elif args.mq:
+        crf = "24"
+    elif args.hq:
+        crf = "21"
+    elif args.ulq:
+        crf = "31"
+elif args.av1:
+    if args.lq:
+        crf = "32"
+    elif args.ulq:
+        crf = "37"
+    elif args.mq:
+        crf = "29"
+    elif args.hq:
+        crf = "27"
+    elif args.uhq:
+        crf = "25"
+    elif args.trans:
+        crf = "22"
+
+# Delete project file if applicable
+if args.projectdelete:
+    if os.path.exists(project_logfile):
+        os.remove(project_logfile)
+        print('Deleted.')
+    else:
+        print('The logfile for this project at {} does not exist. Not deleting anything.'.format(project_logfile))
+    sys.exit()
+
+# Necessary checks
+if not args.altexec and not shutil.which('ffmpeg'):
+    sys.exit('ffmpeg path not found.  Is ffmpeg installed?')
+if not shutil.which('ionice'):
+    sys.exit('ionice tool not found.  Is it installed? This is normally provied by util-linux and would be present on all linux systems.')
+if args.altexec and not os.path.isfile(args.altexec):
+    sys.exit('File specified for the alternative executable ({}) not found. Exiting.'.format(args.altexec))
+
+# Delete tempfile
+def deleteTemp():
+    if args.verbose: print('Deleting temp file!')
+    try:
+        os.remove(temp_video)
+    except Exception as E:
+        if args.verbose: print(E)
+
+def getSize(video):
+    # Calculate disk space of og file in GB
+    size = float(os.path.getsize(video))/1024/1024
+    return size
+
+def getSizeBytes(video):
+    # Calculate disk space of og file in GB
+    size = float(os.path.getsize(video))
+    return size
+
+def print_license():
+    print('''This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.''')
+    sys.exit()
+
+def walkGenerator():
+    if args.verbose: print('walkGenerator() start')
+    if args.perdurationfirst:
+        print('Generating file dictionary by bitrate...')
+    elif args.persizeresfirst:
+        print('Generating file dictionary by megabytes per pixel per second...')
+    elif args.largestfirst:
+        print('Generating file dictionary by file size...')
+    else:
+        print('Generating file dictionary with an unsorted method...')
+    file_dict = {}
+
+    # Fxn Ffprobe call to deterine video duration
+    def getDuration(video):
+        subprocess_list = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video]
+        try:
+            duration = round(float(subprocess.check_output(subprocess_list, stderr=subprocess.PIPE).decode().rstrip()))
+        except KeyboardInterrupt:
+            sys.exit('Goodbye.')
+        except:
+            print('Unable to calculate duration for {}. Will treat it as if it is about 25 minutes long for the purposes of any bitrate estimation.'.format(video))
+            duration = 1500
+        return duration
+
+    # Fxn Ffprobe call to deterine video resolution
+    def getResolution(video):
+        try:
+            subprocess_list = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', video]
+            resolution = subprocess.check_output(subprocess_list, stderr=subprocess.PIPE).decode().rstrip()
+            resmultiple = int(resolution.split('x')[0]) * int(resolution.split('x')[1])
+        except KeyboardInterrupt:
+            sys.exit('Goodbye.')
+        except Exception as E:
+            if args.verbose: print('Unable to determine resolution for {}\n{}'.format(video, E))
+            resmultiple = 1000 * 1000
+        return resmultiple
+
+    # Fxn Ffprobe call to determine audio stream format
+    def getAudioCodec(video):
+        try:
+            subprocess_list = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video]
+            codec = subprocess.check_output(subprocess_list, stderr=subprocess.PIPE).decode()
+        except KeyboardInterrupt:
+            sys.exit('Goodbye.')
+        except:
+            print('Failed to determine audio format for {}'.format(video))
+        return codec
+
+    # Actual walk
+    try:
+        for root, dirs, files in os.walk(args.tardir):
+            for file in files:
+                if os.path.splitext(root + os.sep + file)[1].lower() in format_list:
+                    if args.perdurationfirst:
+                        if args.exclude not in file:
+                            file_dict[os.path.abspath(root + os.sep + file)] = [round(getSize(root + os.sep + file)), getDuration(root + os.sep + file)]
+                    elif args.persizeresfirst:
+                        if args.exclude not in file:
+                            file_dict[os.path.abspath(root + os.sep + file)] = [round(getSize(root + os.sep + file)), getDuration(root + os.sep + file), getResolution(root + os.sep + file)]
+                    else:
+                        if args.exclude not in file:
+                            file_dict[os.path.abspath(root + os.sep + file)] = round(getSize(root + os.sep + file))
+    except KeyboardInterrupt:
+        sys.exit('Goodbye.')
+
+    if args.largestfirst:
+        tuple_list = sorted(file_dict.items(), key=lambda x: x[1])
+        file_dict = {}
+        for elem in tuple_list:
+            file_dict[elem[0]] = elem[1]
+        # Reverse the dictionary
+        file_dict=dict(reversed(list(file_dict.items())))
+    elif args.perdurationfirst:
+        for video in file_dict:
+            file_dict[video] = file_dict[video][0]/file_dict[video][1]
+        tuple_list = sorted(file_dict.items(), key=lambda x: x[1])
+        file_dict = {}
+        for elem in tuple_list:
+            file_dict[elem[0]] = elem[1]
+        # Reverse the dictionary
+        file_dict=dict(reversed(list(file_dict.items())))
+    elif args.persizeresfirst:
+        for video in file_dict:
+            file_dict[video] = file_dict[video][0]/file_dict[video][1]/file_dict[video][2]
+        tuple_list = sorted(file_dict.items(), key=lambda x: x[1])
+        file_dict = {}
+        for elem in tuple_list:
+            file_dict[elem[0]] = elem[1]
+        # Reverse the dictionary
+        file_dict=dict(reversed(list(file_dict.items())))
+
+    # Print dictionary in verbse mode
+    if args.verbose:
+        print('Printing file dictionary to work in sorted order.')
+        for i in file_dict: print(file_dict[i])
+
+    if args.verbose: print('walkGenerator() return with {} entries'.format(len(file_dict)))
+    return file_dict
+
+def writeLog(donevideo):
+    f = open(project_logfile, 'a')
+    f.write(donevideo); f.close()
+
+def subprocessBuildAV1(original_file, timestamp=1, sample_mode=False, copy=False):
+     if args.verbose: print('in subprocessBuildAV1()')
+     # Build basic subprocess
+     subprocess_list = ['ionice', '-c', '3', 'nice', 'ffmpeg', '-y', '-loglevel', 'error', '-stats', '-hide_banner']
+     if args.verbose:
+         subprocess_list.extend(['-loglevel', 'error'])
+     else:
+         subprocess_list.extend(['-loglevel', 'fatal', '-stats'])
+
+     # Set timestamps in sample mode
+     if sample_mode:
+         subprocess_list.append('-ss'); subprocess_list.append(timestamp)
+         subprocess_list.extend(['-t', str(sample_length)])
+
+     # Add input file
+     subprocess_list.extend(['-i', original_file])
+
+     # Copy all audio streams and subtitles
+     subprocess_list.extend(['-map', '0:a?', '-map', '0:s?', '-map', '0:v'])
+
+     # Set rescale if specified.  Only do this when transcoding to allow for proper comparisons!
+     if not copy:
+         if args.r720:
+             if not args.resizehack:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=1280:-1:flags=lanczos')
+             else:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=1280:720:flags=lanczos')
+         elif args.r1080:
+             if not args.resizehack:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=1920:-1:flags=lanczos')
+             else:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=1920:1080:flags=lanczos')
+         elif args.r480:
+             if not args.resizehack:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=853:-1:flags=lanczos')
+             else:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=853:480:flags=lanczos')
+
+     # Set audio channel number
+     if args.stereo:
+         subprocess_list.append('-ac'); subprocess_list.append('2')
+     else:
+        # Detect channel numbers
+        try:
+            subprocess_check_channels_list = ['ffprobe', '-v', 'error', '-i', original_file, '-show_entries', 'stream=channels', '-select_streams', 'a:0', '-of', 'compact=p=0:nk=1']     
+            channels_output = subprocess.check_output(subprocess_check_channels_list).decode().rstrip()
+            if '\n' in channels_output:
+                channels = int(channels_output.split('\n')[0])
+            else:
+                channels = int(channels_output)
+        except:
+            print('Failed to detect channels.  Does this video lack an audio stream?')
+            channels = 0
+        if channels > 2 or channels == 0:
+            args.noaudiocopy = False
+        if channels > 2 or channels == 0:
+            print('Audio stream has more than 2 channels or is absent.  Copying stream rather than convering to opus.')
+
+     # Set svt-av1 output format, but in copy mode to calculate original segment sizes then just do a straight stream copy of the video
+     if not copy:
+         subprocess_list.append('-c:s'); subprocess_list.append('copy')
+         subprocess_list.append('-c:v'); subprocess_list.append('libsvtav1')
+         # Set crf
+         subprocess_list.append('-crf'); subprocess_list.append(crf)
+
+         # Set preset (determines speed of encode)
+         if not sample_mode:
+             subprocess_list.append('-preset'); subprocess_list.append(preset)
+         elif sample_mode:
+             subprocess_list.append('-preset'); subprocess_list.append('6')  
+
+         # Set pixel format (10 bit) 
+         subprocess_list.extend(['-pix_fmt', 'yuv420p10le'])
+
+         # Add film grain synthesis
+         if args.filmgrain:
+             subprocess_list.extend(['-svtav1-params', 'tune=0'])
+     else:
+         subprocess_list.append('-c:v'); subprocess_list.append('copy')
+     # Set audio outputs
+     if not args.noaudiocopy:
+         subprocess_list.append('-c:a'); subprocess_list.append('copy')
+     else:
+         subprocess_list.append('-c:a'); subprocess_list.append('libopus')
+         subprocess_list.append('-b:a'); subprocess_list.append('128k')
+         #subprocess_list.append('-c:a'); subprocess_list.append('aac')
+         #subprocess_list.append('-b:a'); subprocess_list.append('128k')
+     # Set output filename and output container format
+     if args.mkv:
+         if not sample_mode:
+             args.outfile = os.path.splitext(original_file)[0] + '_tc.mkv'
+         else:
+             args.outfile = temp_video
+     else:
+         if not sample_mode:
+             args.outfile = os.path.splitext(original_file)[0] + '_tc.mp4'
+         else:
+             args.outfile = temp_video
+     # Append to subprocess call list and return
+     subprocess_list.append(args.outfile)
+     if args.verbose: print('subprocessBuildAV1() return')
+     return subprocess_list
+
+def subprocessBuild(original_file, timestamp=1, sample_mode=False, copy=False):
+     if args.verbose: print('in subprocessBuild()')
+     # Build basic subprocess
+     subprocess_list = ['ionice', '-c', '3', 'nice', 'ffmpeg', '-y', '-loglevel', 'error', '-stats', '-hide_banner']
+     if args.verbose:
+         subprocess_list.extend(['-loglevel', 'error'])
+     else:
+         subprocess_list.extend(['-loglevel', 'fatal', '-stats'])
+
+     # Set timestamps in sample mode
+     if sample_mode:
+         subprocess_list.append('-ss'); subprocess_list.append(timestamp)
+         subprocess_list.extend(['-t', str(sample_length)])
+
+     # Add input file
+     subprocess_list.extend(['-i', original_file])
+
+     # Copy all audio streams and subtitles
+     subprocess_list.extend(['-map', '0:a?', '-map', '0:s?', '-map', '0:v'])
+
+     # Set rescale if specified.  Only do this when transcoding to allow for proper comparisons!
+     if not copy:
+         if args.r720:
+             if not args.resizehack:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=1280:-1:flags=lanczos')
+             else:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=1280:720:flags=lanczos')
+         elif args.r1080:
+             if not args.resizehack:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=1920:-1:flags=lanczos')
+             else:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=1920:1080:flags=lanczos')
+         elif args.r480:
+             if not args.resizehack:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=853:-1:flags=lanczos')
+             else:
+                 subprocess_list.append('-vf'); subprocess_list.append('scale=853:480:flags=lanczos')
+
+     # Set audio channel number
+     if args.stereo:
+         subprocess_list.append('-ac'); subprocess_list.append('2')
+     else:
+        # Detect channel numbers
+        try:
+            subprocess_check_channels_list = ['ffprobe', '-v', 'error', '-i', original_file, '-show_entries', 'stream=channels', '-select_streams', 'a:0', '-of', 'compact=p=0:nk=1']     
+            channels_output = subprocess.check_output(subprocess_check_channels_list).decode().rstrip()
+            if '\n' in channels_output:
+                channels = int(channels_output.split('\n')[0])
+            else:
+                channels = int(channels_output)
+        except:
+            print('Failed to detect channels.  Does this video lack an audio stream?')
+            channels = 0
+        if channels > 2 or channels == 0:
+            args.noaudiocopy = False
+        if channels > 2 or channels == 0:
+            print('Audio stream has more than 2 channels or is absent.  Copying stream rather than convering to opus.')
+
+     # Set x265 output format, but in copy mode to calculate original segment sizes then just do a straight stream copy of the video
+     if not copy:
+         subprocess_list.append('-c:s'); subprocess_list.append('copy')
+         subprocess_list.append('-c:v'); subprocess_list.append('libx265')
+         if not sample_mode:
+             subprocess_list.append('-preset'); subprocess_list.append(preset)
+         else:
+             subprocess_list.append('-preset'); subprocess_list.append('slow') # Just use slow preset when sampling to speed up the process.  Result difference negligible.
+         if args.animation:
+             subprocess_list.extend(['-tune', 'animation'])
+         elif args.filmgrain:
+             subprocess_list.extend(['-tune', 'grain'])
+         # Set crf
+         subprocess_list.append('-crf'); subprocess_list.append(crf)
+       
+         # Set pixel format (10 bit) 
+         subprocess_list.extend(['-pix_fmt', 'yuv420p10le'])
+     else:
+         subprocess_list.append('-c:v'); subprocess_list.append('copy')
+     # Set audio outputs
+     if not args.noaudiocopy:
+         subprocess_list.append('-c:a'); subprocess_list.append('copy')
+     else:
+         subprocess_list.append('-c:a'); subprocess_list.append('libopus')
+         subprocess_list.append('-b:a'); subprocess_list.append('128k')
+         #subprocess_list.append('-c:a'); subprocess_list.append('aac')
+         #subprocess_list.append('-b:a'); subprocess_list.append('128k')
+     # Set output filename and output container format
+     if args.mkv:
+         if not sample_mode:
+             args.outfile = os.path.splitext(original_file)[0] + '_tc.mkv'
+         else:
+             args.outfile = temp_video
+     else:
+         if not sample_mode:
+             args.outfile = os.path.splitext(original_file)[0] + '_tc.mp4'
+         else:
+             args.outfile = temp_video
+     # Append to subprocess call list and return
+     subprocess_list.append(args.outfile)
+     if args.verbose: print('subprocessBuild() return')
+     return subprocess_list
+
+def startTranscode(subprocess_list, stats=False):
+        # Run shell
+        if args.verbose: print('in startTranscode()')
+        if args.verbose: print('ffmpeg call: {}'.format(" ".join(subprocess_list)))
+        if not args.dry:
+            try:
+                if args.verbose:
+                    subprocess.call(subprocess_list)
+                else:
+                    if stats:
+                        subprocess.call(subprocess_list)
+                    else:
+                        subprocess.call(subprocess_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if getSizeBytes(subprocess_list[-1]) == 0:
+                    print('Output file is 0 KiB. Triggering a failure state.')
+                    success = False
+                    raise Exception
+                else:
+                    success = True
+            except Exception as E:
+                success = False
+                print('\aException occurred when encoding file!\n{}'.format(E))
+        elif args.dry:
+            sys.exit(" ".join(subprocess_list))
+        if args.verbose: print('startTranscode() return')
+        return success
+
+def startTranscodeAV1(subprocess_list, stats=False):
+        # Run shell
+        subprocess_string = " ".join(subprocess_list)
+        if args.verbose: print('in startTranscodeAV1()')
+        if args.verbose: print('ffmpeg call: {}'.format(subprocess_string))
+        if not args.dry:
+            try:
+                if args.verbose:
+                    subprocess.call(" ".join(subprocess_list), shell=True)
+                else:
+                    if stats:
+                        subprocess.call(" ".join(subprocess_list), shell=True)
+                    else:
+                        subprocess.call(" ".join(subprocess_list), stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+                success = True
+            except Exception as E:
+                print('Exception occurred when encoding file!: {}'.format(E))
+                success = False
+        elif args.dry:
+            print(subprocess_string)
+            success = True
+        if args.verbose: print('startTranscodeAV1() return')
+        return success
+
+def sizeCompare(fs_new, fs_og, success, original_file):
+        ''' After transcode of full video then good to compare the original and new file size and then deleting accordingly! Prevents bad replacement due to sample errors'''
+        # Get size of new file
+        fs_delta = float(fs_og - fs_new)
+        fs_ratio = float(fs_og/fs_new)
+        print('Original file was {:.2f}MB. New file is {:.2f}MB.\n\aTotal space saving is {:.2f}MB'.format(fs_og, fs_new, fs_delta))
+        print('Compression ratio: {:.2f}'.format(fs_ratio)) # Determine whether to keep or delete files
+        if success:
+            if fs_ratio > args.cutoff:
+                size_is_good = True
+                if not args.interactive:
+                    print('Deleting original file as sufficient compression threshold has been met!')
+                    if not args.nodelete:
+                        os.remove(original_file)
+                else:
+                    ans = input('Delete original file? Y/n ')
+                    if ans.lower() == 'y':
+                        print('Removing {}'.format(original_file))
+                        os.remove(original_file)
+            else:
+                size_is_good = False
+                if not args.nodelete:
+                    print('Deleting transcode as the compression ratio makes this not worthwhile!')
+                    os.remove(args.outfile)
+        elif not success:
+                size_is_good = False
+                if not args.nodelete:
+                    print('As transcode not successful then deleting transcode file.')
+                    os.remove(args.outfile)
+        else:
+            size_is_good = False
+        return size_is_good
+
+def stampGen(video, sample_points, sample_length):
+    subprocess_list = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video]
+    duration = round(float(subprocess.check_output(subprocess_list, stderr=subprocess.PIPE).decode()))
+    print('Original video length: {:.0f}s (approx {:.0f}m)'.format(duration, duration/60))
+    stamp_list = []
+    stamp_list.append(round(duration/sample_points))
+    for sample in range(sample_points-1):
+        stamp_list.append(stamp_list[-1] + round(duration/sample_points))
+    if args.verbose: print("Time stamps are as follows in seconds: {}".format(stamp_list))
+    # Left-align / subtract values
+    for index, value in enumerate(stamp_list):
+        stamp_list[index] = value - sample_length * 2
+    for index, value in enumerate(stamp_list):
+        if value >= duration - sample_length:
+            print('Removing a sample value as it is too high!')
+            del stamp_list[index]
+    for index, value in enumerate(stamp_list):
+        if value <= sample_length:
+            print('Removing a sample value as it is too low!')
+            del stamp_list[index]
+    return stamp_list
+
+def calcScore(sample_size_list_original, sample_size_list_new):
+    if args.verbose:
+        print("Sample sizes for original file in MB: {}".format(sample_size_list_original))
+        print("Sample sizes for encode in MB: {}".format(sample_size_list_new))
+    ratio_list = []
+    for index in range(len(sample_size_list_original)):
+        ratio_list.append(sample_size_list_original[index]/sample_size_list_new[index])
+    compression_score = mean(ratio_list)
+    return compression_score
+
+def userAlert(size_is_good, video, success):
+        # Alert user via notify-osd
+        if args.alert:
+            subprocess.call(['notify-send', '--urgency=critical', 'Transcode of {} complete!'.format(video)])
+        # Alert user via audio chime if specified and user isn't AFK
+        if args.alert and success:
+            if size_is_good:
+                subprocess.call(['paplay', '/opt/bin/chime.wav'])
+            elif not size_is_good:
+                subprocess.call(['paplay', '/opt/bin/boohiss.wav'])
+        elif args.alert and not success:
+            print('ffmpeg returned an error code!')
+            subprocess.call(['paplay', '/opt/bin/boohiss.wav'])
+
+def readLog():
+    if os.path.exists(project_logfile):
+        with open(project_logfile) as f:
+            log_lines = [line.rstrip() for line in f]
+        return log_lines
+
+def isInLog(log_lines, video):
+    if os.path.exists(project_logfile):
+        if video in log_lines:
+            return True
+        else:
+            return False
+    else:
+        return False
+
+def remuxVideo(video):
+    if args.mkv:
+        new_file = os.path.splitext(video)[0] + '.mkv'
+    elif args.mp4:
+        new_file = os.path.splitext(video)[0] + '.mp4'
+    try:
+        subprocess.call(['ffmpeg', '-y', '-loglevel', 'error', '-hide_banner', '-i', video, '-c:v', 'copy', '-c:s', 'copy', '-c:a', 'copy', new_file])
+        print('Remux successful. Keeping remuxed file and deleting the original source.')
+        os.remove(video)
+    except:
+        print('Remux of file from .ts container failed. Deleting remux file.')
+    return new_file 
+
+def main():
+    if args.license:
+        print_license()
+    if not args.tardir:
+        sys.exit('Target directory (-t/--tardir) has not been specified. Exiting.')
+    deleteTemp()
+    file_list = walkGenerator()
+    for video in file_list:
+        # Project per video skip
+        if args.project:
+            log_lines = readLog()
+            if isInLog(log_lines, video):
+                if args.verbose: print("{} is in the project log. Skipping.".format(video))
+                continue
+
+        # Get file info and stamps
+        print('\nCurrent working file:\n{}'.format(video))
+
+        # If file is in .ts container then recontainerise it first
+        if os.path.splitext(video)[1].lower() == '.ts':
+            print('This file is in a .ts container.  In order to estimate compressability then it is necessary to first remux it into a more appropriate container.')
+            video = remuxVideo(video)
+            video_is_ts = True 
+        else:
+            video_is_ts = False
+
+        og_size = getSize(video)
+        print('Original video size: {:.2f}MB'.format(og_size))
+        print('Estimating video compressabiity using equidistant {} point sample method...'.format(sample_points))
+        stamp_list = stampGen(video, sample_points, sample_length)
+        if args.verbose: print("Sampling at the following time points in seconds: ".format(str(stamp_list)))
+        sample_size_list_new = []; sample_size_list_original = []
+        print('Sampling. Please wait....')
+
+        # Original copy sample
+        for timestamp in stamp_list:
+            subprocess_list_original = subprocessBuild(video, timestamp=str(timestamp), sample_mode=True, copy=True)
+            if args.verbose: print('Sampling original using copy method at {} seconds for {} seconds...'.format(str(timestamp), sample_length))
+            success = startTranscode(subprocess_list_original)
+            if not success:
+                print('Copy transcode unsuccessful.')
+                continue
+            sample_size_list_original.append(getSize(temp_video))
+            deleteTemp()
+
+        # Transcode sample
+        for timestamp in stamp_list:
+            if args.verbose: print('Sampling using transcode method at {} seconds for {} seconds...'.format(str(timestamp), sample_length))
+            if not args.av1:
+                subprocess_list_new = subprocessBuild(video, timestamp=str(timestamp), sample_mode=True, copy=False)
+            else:
+                subprocess_list_new = subprocessBuildAV1(video, timestamp=str(timestamp), sample_mode=True, copy=False)
+
+            if not args.av1:
+                success = startTranscode(subprocess_list_new)
+            else:
+                success = startTranscodeAV1(subprocess_list_new)
+
+            sample_size_list_new.append(getSize(temp_video))
+            deleteTemp()
+        try:
+            compression_score = calcScore(sample_size_list_original, sample_size_list_new)
+        except:
+            # Log sampled file in project mode
+            if args.project: writeLog(video + '\n')
+            print('Failed to calculate compression score:\nOriginal: {} Sample: {}\nMoving on...'.format(sample_size_list_original, sample_size_list_new))
+            continue
+            
+        # Adjust compression score.  I tend to find that my sample factors estimates are off by about -0.8 to -0.4 on average, at least with sample_points 3, length 16 (in favour of underestimation)
+        if compression_score > 1:
+            compression_score = compression_score - 0.6
+
+        print('Estimated adjusted compression ratio: {:.2f}'.format(compression_score))
+        if args.samplecutoff:
+            if compression_score > args.samplecutoff:
+                print('EXCITING! THE TRANSCODED VIDEO HAS A SIZE BENEFIT ABOVE THE CUTOFF!')
+        elif not args.samplecutoff:
+            if compression_score > args.cutoff:
+                print('EXCITING! THE TRANSCODED VIDEO HAS A SIZE BENEFIT ABOVE THE CUTOFF!')
+        else:
+            print('Benefit ratio below the cutoff ({}). Will not transcode.'.format(args.cutoff))
+        def testVideo(video):
+            if shutil.which('mpv'):
+                subprocess.Popen(['mpv', video])
+            elif shutil.which('vlc'):
+                subprocess.Popen(['vlc', video])
+            else:
+                print('No valid video player found in path. Video will not be tested.')
+
+        # Encode real video
+        def encodeReal(video, subprocess_list):
+            if args.av1:
+                subprocess_list = subprocessBuildAV1(video, sample_mode=False, copy=False)
+            else:
+                subprocess_list = subprocessBuild(video, sample_mode=False, copy=False)
+            print('Starting transcode of full video. Please be patient!')
+
+            try:
+                if args.av1:
+                    success = startTranscodeAV1(subprocess_list, stats=True)
+                else:
+                    success = startTranscode(subprocess_list, stats=True)
+            except KeyboardInterrupt:
+                print('Interrupt caught! Deleting transcode file!')
+                if os.path.exists(subprocess_list[-1]):
+                    os.remove(subprocess_list[-1])
+                sys.exit()
+
+            # Get size
+            new_size = getSize(subprocess_list[-1])
+            size_is_good = sizeCompare(new_size, og_size, success, video)
+
+            # Alert user
+            if args.alert:
+                userAlert(size_is_good, video, success)
+
+        # Do not continue is filename too long
+        max = os.statvfs(os.path.dirname(subprocess_list_new[-1])).f_namemax
+        current = len(os.path.basename(video))
+        if current > max:
+            print('New filename is too long for the filesystem. Skipping file.')
+            continue
+
+        # In manual mode just query use and send file
+        if not args.notranscode and args.interactive:
+                ans = input('Attempt to transcode? Y/n ')
+                if not ans.lower() == 'y':
+                    break
+                else:
+                    encodeReal(video, subprocess_list_new)
+                    if args.test:
+                        testVideo(subprocess_list_new[-1])
+        # In auto mode send file to ffmpeg as per speified cutoff
+        elif not args.interactive and compression_score > args.cutoff:
+            # Catches when using different sample cutoff
+            if args.samplecutoff:
+                if compression_score > args.samplecutoff:
+                    if args.verbose: print('Auto mode: Sending encodeReal() call so that ffmpeg can handle the final video.')
+                    encodeReal(video, subprocess_list_new)
+            # Catches when using universal cutoff
+            elif not args.samplecutoff:
+                if args.verbose: print('Auto mode: Sending encodeReal() call so that ffmpeg can handle the final video.')
+                encodeReal(video, subprocess_list_new)
+            if args.test:
+                testVideo(subprocess_list_new[-1])
+
+        # Log sampled file in project mode
+        if args.project: writeLog(video + '\n')
+
+
+if __name__ == '__main__':
+    main()
