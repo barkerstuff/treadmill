@@ -11,5 +11,5 @@ The AV-1 side of this tool is not yet complete, as I am waiting for ffmpeg 5 to 
 
 This tool has been tested and used on linux only, but should be able to support both MacOS and Windows. 
 
-Dependencies: ffmpeg, libnotify (for alert option)
+Dependencies: ffmpeg, libnotify (only for the alert option, linux only)
 
